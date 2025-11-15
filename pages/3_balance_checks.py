@@ -1,115 +1,184 @@
 import numpy as np
 import pandas as pd
 import streamlit as st
-from scipy import stats
 
-st.title("📊 Balance Checks (Baseline Comparability)")
+try:
+    from scipy import stats
+    HAVE_SCIPY = True
+except ImportError:
+    HAVE_SCIPY = False
+
+st.title("🔍 Balance Checks (Baseline Comparability)")
 
 st.markdown(
     """
-This page provides **baseline balance checks** similar to `orth_out` / `ietoolkit`:
+Upload a dataset **after randomization** (with a 0/1 treatment column, e.g. `treat`)
+and select baseline covariates to check whether **Treatment** and **Control** groups
+are similar **before** the intervention.
 
-- Compare means of covariates between treatment and control  
-- Compute standardized mean differences (SMD)  
-- Compute t-test p-values  
+This page will compute, for each covariate:
 
-**Workflow**
-
-1. Upload a baseline dataset with a treatment indicator.  
-2. Select the treatment column (0/1) and covariates.  
-3. View and download the balance table.
+- Mean in Control and Treatment  
+- Difference in means  
+- Standardized Mean Difference (SMD)  
+- t-test p-value (if SciPy is available)  
 """
 )
 
 uploaded_file = st.file_uploader(
-    "Upload baseline dataset (CSV or Excel)", type=["csv", "xlsx"], key="balance_file"
+    "Upload dataset with treatment indicator", type=["csv", "xlsx"], key="bal_file"
 )
 
 if uploaded_file is not None:
-    if uploaded_file.name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
+    # --- Read file ---
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"Could not read the uploaded file: {e}")
+        st.stop()
+
+    if df.empty:
+        st.error("The uploaded file appears to be empty.")
+        st.stop()
 
     st.subheader("Preview of uploaded data")
     st.dataframe(df.head())
 
-    treat_col = st.selectbox("Treatment indicator column (0/1)", options=df.columns)
-    covariate_cols = st.multiselect(
+    # --- Select treatment column ---
+    treat_col = st.selectbox(
+        "Treatment indicator column (0/1)",
+        options=df.columns,
+        index=list(df.columns).index("treat") if "treat" in df.columns else 0,
+    )
+
+    # Try to coerce treatment column to numeric 0/1
+    try:
+        df[treat_col] = pd.to_numeric(df[treat_col], errors="coerce")
+    except Exception:
+        st.error(f"Treatment column '{treat_col}' could not be converted to numeric.")
+        st.stop()
+
+    if not set(df[treat_col].dropna().unique()).issubset({0, 1}):
+        st.warning(
+            f"Treatment column '{treat_col}' does not look like a 0/1 indicator. "
+            "Make sure Treatment = 1 and Control = 0."
+        )
+
+    # --- Select covariates ---
+    covariates = st.multiselect(
         "Covariate columns to check balance on",
         options=[c for c in df.columns if c != treat_col],
     )
 
-    if treat_col and covariate_cols:
-        # Ensure treatment is binary
-        if df[treat_col].nunique() <= 1:
-            st.error("Treatment column must have at least two distinct values (0 and 1).")
-        else:
-            treat_mask = df[treat_col] == df[treat_col].unique()[0]
-            # Better: define as 1 vs 0; assume 1 = treated if present
-            if 1 in df[treat_col].unique():
-                treat_mask = df[treat_col] == 1
-            else:
-                # fallback: first unique value = treatment
-                treat_mask = df[treat_col] == df[treat_col].unique()[0]
+    if st.button("Run balance checks", type="primary"):
+        if len(covariates) == 0:
+            st.error("Please select at least one covariate.")
+            st.stop()
 
-            treated = df[treat_mask]
-            control = df[~treat_mask]
+        results = []
+        notes = []
 
-            rows = []
-            for col in covariate_cols:
-                x_t = treated[col].dropna()
-                x_c = control[col].dropna()
+        def to_numeric_cov(series: pd.Series):
+            """
+            Convert covariate to numeric for balance checks.
 
-                if x_t.empty or x_c.empty:
-                    continue
+            - If already numeric → return as float
+            - If binary categorical → map one category to 1, the other to 0
+            - Else → raise TypeError so we can skip it with a warning
+            """
+            if pd.api.types.is_numeric_dtype(series):
+                return series.astype(float), None
 
-                mean_t = x_t.mean()
+            # Non-numeric: try binary categorical
+            uniq = series.dropna().unique()
+            if len(uniq) == 2:
+                ref = uniq[0]
+                num = (series == ref).astype(int)
+                note = (
+                    f"'{series.name}' treated as binary: "
+                    f"{ref} = 1, other = 0."
+                )
+                return num, note
+
+            raise TypeError(
+                f"Covariate '{series.name}' is non-numeric with {len(uniq)} categories; "
+                "only numeric or binary categorical variables are supported."
+            )
+
+        for cov in covariates:
+            try:
+                s_orig = df[cov]
+                s_num, note = to_numeric_cov(s_orig)
+
+                mask_c = df[treat_col] == 0
+                mask_t = df[treat_col] == 1
+
+                x_c = s_num[mask_c].dropna()
+                x_t = s_num[mask_t].dropna()
+
+                if x_c.empty or x_t.empty:
+                    raise ValueError(
+                        f"No non-missing data for '{cov}' in one of the groups."
+                    )
+
                 mean_c = x_c.mean()
-                sd_t = x_t.std(ddof=1)
-                sd_c = x_c.std(ddof=1)
+                mean_t = x_t.mean()
                 diff = mean_t - mean_c
 
-                # pooled SD for SMD
-                n_t = len(x_t)
-                n_c = len(x_c)
-                s_pooled = np.sqrt(
-                    ((n_t - 1) * sd_t**2 + (n_c - 1) * sd_c**2) / (n_t + n_c - 2)
-                ) if (n_t + n_c - 2) > 0 else np.nan
-                smd = diff / s_pooled if s_pooled not in [0, np.nan] else np.nan
+                # Pooled SD for SMD
+                var_c = x_c.var(ddof=1)
+                var_t = x_t.var(ddof=1)
+                sd_pooled = np.sqrt((var_c + var_t) / 2) if (var_c + var_t) > 0 else np.nan
+                smd = diff / sd_pooled if sd_pooled > 0 else np.nan
 
-                # t-test (Welch)
-                try:
-                    tstat, pval = stats.ttest_ind(x_t, x_c, equal_var=False, nan_policy="omit")
-                except Exception:
-                    tstat, pval = np.nan, np.nan
+                # t-test p-value (if SciPy available)
+                if HAVE_SCIPY:
+                    t_stat, p_val = stats.ttest_ind(x_t, x_c, equal_var=False, nan_policy="omit")
+                else:
+                    p_val = np.nan
 
-                rows.append(
+                results.append(
                     {
-                        "variable": col,
-                        "mean_treat": mean_t,
+                        "covariate": cov,
                         "mean_control": mean_c,
-                        "diff": diff,
-                        "std_diff": smd,
-                        "p_value": pval,
-                        "n_treat": n_t,
-                        "n_control": n_c,
+                        "mean_treatment": mean_t,
+                        "diff_treat_minus_control": diff,
+                        "SMD": smd,
+                        "p_value": p_val,
+                        "n_control": int(mask_c.sum()),
+                        "n_treatment": int(mask_t.sum()),
                     }
                 )
+                if note:
+                    notes.append(note)
 
-            if rows:
-                bal_table = pd.DataFrame(rows)
-                st.subheader("Balance table")
-                st.dataframe(bal_table)
+            except Exception as e:
+                st.warning(f"Skipping '{cov}': {e}")
 
-                csv = bal_table.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download balance table (CSV)",
-                    data=csv,
-                    file_name="balance_checks.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.warning("No valid covariates selected for balance checks.")
+        if len(results) == 0:
+            st.error("No covariates could be processed. Check variable types.")
+            st.stop()
+
+        res_df = pd.DataFrame(results)
+        st.subheader("Balance table")
+        st.dataframe(res_df)
+
+        if notes:
+            st.subheader("Notes on covariate coding")
+            for n in notes:
+                st.info(n)
+
+        # Optional: download results
+        csv_bal = res_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download balance results (CSV)",
+            data=csv_bal,
+            file_name="balance_checks_results.csv",
+            mime="text/csv",
+        )
+
 else:
-    st.info("👆 Upload a dataset to get started.")
+    st.info("👆 Upload a dataset with a treatment indicator to run balance checks.")
